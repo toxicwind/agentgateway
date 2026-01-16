@@ -11,6 +11,7 @@ use crate::control::caclient;
 use crate::telemetry::trc;
 use crate::telemetry::trc::Tracer;
 use crate::{Config, ProxyInputs, client, mcp, proxy, state_manager};
+use crate::management::mesh::MeshRegistry;
 
 pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	let (data_plane_handle, data_plane_pool) = new_data_plane_pool(config.num_worker_threads);
@@ -98,6 +99,8 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	// Run the XDS state manager in the current tokio worker pool.
 	tokio::spawn(state_mgr.run());
 
+	let mesh_registry = MeshRegistry::new(stores.clone());
+
 	#[allow(unused_mut)]
 	let mut admin_server = crate::management::admin::Service::new(
 		config.clone(),
@@ -105,6 +108,7 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 		shutdown.trigger(),
 		drain_rx.clone(),
 		data_plane_handle.clone(),
+		mesh_registry,
 	)
 	.await
 	.context("admin server starts")?;

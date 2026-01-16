@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod mesh;
 pub mod metrics_server;
 pub mod readiness_server;
 

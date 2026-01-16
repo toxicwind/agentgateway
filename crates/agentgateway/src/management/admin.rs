@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use tracing_subscriber::filter;
 
 use super::hyper_helpers::{Server, empty_response, plaintext_response};
+use super::mesh::{MeshHeartbeat, MeshRegistry};
 use crate::Config;
 use crate::http::Response;
 
@@ -45,6 +46,7 @@ struct State {
 	config_dump_handlers: Vec<Arc<dyn ConfigDumpHandler>>,
 	admin_fallback: Option<Arc<dyn AdminFallback>>,
 	dataplane_handle: Handle,
+	mesh_registry: MeshRegistry,
 }
 
 pub struct Service {
@@ -86,6 +88,7 @@ impl Service {
 		shutdown_trigger: signal::ShutdownTrigger,
 		drain_rx: DrainWatcher,
 		dataplane_handle: Handle,
+		mesh_registry: MeshRegistry,
 	) -> anyhow::Result<Self> {
 		Server::<State>::bind(
 			"admin",
@@ -98,6 +101,7 @@ impl Service {
 				config_dump_handlers: vec![],
 				admin_fallback: None,
 				dataplane_handle,
+				mesh_registry,
 			},
 		)
 		.await
@@ -144,6 +148,9 @@ impl Service {
 					.await
 				},
 				"/logging" => Ok(handle_logging(req).await),
+				"/mesh/register" => Ok(handle_mesh_register(&state.mesh_registry, req).await),
+				"/mesh/nodes" => Ok(handle_mesh_nodes(&state.mesh_registry, req).await),
+				"/mesh/logs" => Ok(handle_mesh_logs(&state.mesh_registry, req).await),
 				_ => {
 					if let Some(h) = &state.admin_fallback {
 						Ok(h.handle(req).await)
@@ -450,4 +457,118 @@ async fn handle_jemalloc_pprof_heapgen(_req: Request<Incoming>) -> anyhow::Resul
 			.body("jemalloc not enabled".into())
 			.expect("builder with known status code should not fail"),
 	)
+}
+async fn handle_mesh_register(registry: &MeshRegistry, req: Request<Incoming>) -> Response {
+	use http_body_util::BodyExt;
+	match *req.method() {
+		hyper::Method::POST => {
+			let token = req.headers()
+				.get("X-Mesh-Token")
+				.and_then(|v| v.to_str().ok())
+				.map(|s| s.to_string());
+
+			let body = match req.into_body().collect().await {
+				Ok(b) => b.to_bytes(),
+				Err(e) => {
+					return plaintext_response(
+						hyper::StatusCode::BAD_REQUEST,
+						format!("failed to read body: {e}\n"),
+					);
+				},
+			};
+
+			let heartbeat: MeshHeartbeat = match serde_json::from_slice(&body) {
+				Ok(h) => h,
+				Err(e) => {
+					return plaintext_response(
+						hyper::StatusCode::BAD_REQUEST,
+						format!("failed to parse heartbeat: {e}\n"),
+					);
+				},
+			};
+
+			match registry.register(heartbeat, token) {
+				Ok(new_token) => {
+					let mut resp = plaintext_response(hyper::StatusCode::OK, "registered\n".into());
+					resp.headers_mut().insert(
+						"X-Mesh-Token",
+						hyper::header::HeaderValue::from_str(&new_token).unwrap(),
+					);
+					resp
+				},
+				Err(e) => plaintext_response(
+					hyper::StatusCode::FORBIDDEN,
+					format!("mesh registration denied: {e}\n"),
+				),
+			}
+		},
+		_ => empty_response(hyper::StatusCode::METHOD_NOT_ALLOWED),
+	}
+}
+
+async fn handle_mesh_logs(registry: &MeshRegistry, req: Request<Incoming>) -> Response {
+	use http_body_util::BodyExt;
+	match *req.method() {
+		hyper::Method::POST => {
+			let token = req.headers()
+				.get("X-Mesh-Token")
+				.and_then(|v| v.to_str().ok())
+				.map(|s| s.to_string());
+
+			let body = match req.into_body().collect().await {
+				Ok(b) => b.to_bytes(),
+				Err(e) => {
+					return plaintext_response(
+						hyper::StatusCode::BAD_REQUEST,
+						format!("failed to read body: {e}\n"),
+					);
+				},
+			};
+
+			let log_payload: serde_json::Value = match serde_json::from_slice(&body) {
+				Ok(p) => p,
+				Err(e) => {
+					return plaintext_response(
+						hyper::StatusCode::BAD_REQUEST,
+						format!("failed to parse log payload: {e}\n"),
+					);
+				},
+			};
+
+			let service_name = log_payload.get("serviceName").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+			if let Some(token) = token {
+				if registry.validate_token(service_name, &token) {
+					if let Some(logs) = log_payload.get("logs").and_then(|v| v.as_array()) {
+						for log in logs {
+							info!(target: "mesh_leaf", service=%service_name, ?log, "leaf log");
+						}
+					}
+					return plaintext_response(hyper::StatusCode::OK, "logs processed\n".into());
+				}
+			}
+			plaintext_response(hyper::StatusCode::FORBIDDEN, "invalid mesh token\n".into())
+		},
+		_ => empty_response(hyper::StatusCode::METHOD_NOT_ALLOWED),
+	}
+}
+
+async fn handle_mesh_nodes(registry: &MeshRegistry, _req: Request<Incoming>) -> Response {
+	let nodes = registry.get_nodes();
+	let json_body = match serde_json::to_string_pretty(&nodes) {
+		Ok(j) => j,
+		Err(e) => {
+			return plaintext_response(
+				hyper::StatusCode::INTERNAL_SERVER_ERROR,
+				format!("failed to serialize nodes: {e}\n"),
+			);
+		},
+	};
+
+	let mut response = plaintext_response(hyper::StatusCode::OK, json_body);
+	response.headers_mut().insert(
+		hyper::header::CONTENT_TYPE,
+		hyper::header::HeaderValue::from_static("application/json"),
+	);
+	response
 }
