@@ -1,0 +1,3 @@
+[submodule "vendor/supergateway"]
+	path = vendor/supergateway
+	url = /home/toxic/development/tool-mesh/vendor/supergateway

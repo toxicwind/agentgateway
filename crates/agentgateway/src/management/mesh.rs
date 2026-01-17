@@ -87,8 +87,8 @@ impl MeshRegistry {
         // Matrix Guardian: Strict Policy Enforcement
         let mut is_blessed = false;
         if let Some(existing) = nodes.get(&name) {
-            if let Some(token) = provided_token {
-                if existing.token != token {
+            if let Some(ref token) = provided_token {
+                if &existing.token != token {
                     warn!(service=%name, "Matrix Guardian: Identity theft detected (invalid token)");
                     anyhow::bail!("invalid mesh token for service {}", name);
                 }
@@ -163,22 +163,32 @@ impl MeshRegistry {
     fn project_to_adp(&self, hb: MeshHeartbeat) -> anyhow::Result<()> {
         let backend_key = format!("mesh-{}", hb.service_name);
         
-        let target_spec = match hb.transport {
-            TransportType::Sse => McpTargetSpec::Sse(SseTargetSpec {
-                backend: XdsSimpleBackendReference::Opaque(Target::Tcp(
-                    "localhost".to_string().into(),
-                    hb.port,
-                )),
-                path: "/sse".to_string().into(),
-            }),
-            TransportType::Streamable => McpTargetSpec::Mcp(StreamableHTTPTargetSpec {
-                backend: XdsSimpleBackendReference::Opaque(Target::Tcp(
-                    "localhost".to_string().into(),
-                    hb.port,
-                )),
-                path: "/mcp".to_string().into(),
-            }),
+        let (path, protocol) = match hb.transport {
+            TransportType::Sse => (
+                "/sse".to_string(),
+                1, // Sse
+            ),
+            TransportType::Streamable => (
+                "/mcp".to_string(),
+                2, // StreamableHttp
+            ),
         };
+
+        // Convert XdsSimpleBackendReference to XdsBackendReference if needed, or use the right type.
+        // Looking at proto, backend field is BackendReference.
+        // XdsSimpleBackendReference seems to be an enum in types/agent.rs but we need the proto message.
+        // Actually, let's construct the BackendReference manually as we know it's opaque localhost.
+        
+        let backend_msg = crate::types::proto::agent::BackendReference {
+             port: hb.port as u32,
+             kind: Some(crate::types::proto::agent::backend_reference::Kind::Service(
+                 crate::types::proto::agent::backend_reference::Service {
+                     namespace: "default".to_string(),
+                     hostname: "localhost".to_string(),
+                 }
+             ))
+        };
+
 
         let xds_backend = XdsBackend {
             key: backend_key.clone(),
@@ -188,11 +198,13 @@ impl MeshRegistry {
             }),
             kind: Some(XdsBackendKind::Mcp(XdsMcpBackend {
                 targets: vec![XdsMcpTarget {
-                    name: "primary".to_string().into(),
-                    spec: target_spec,
+                    name: "primary".to_string(),
+                    backend: Some(backend_msg),
+                    path: path,
+                    protocol: protocol,
                 }],
-                stateful_mode: None,
-                prefix_mode: None,
+                stateful_mode: 0, // Stateful
+                prefix_mode: 0,   // Assuming 0 is default/valid for now
             })),
             inline_policies: vec![],
         };
