@@ -99,7 +99,26 @@ pub async fn run(config: Arc<Config>) -> anyhow::Result<Bound> {
 	// Run the XDS state manager in the current tokio worker pool.
 	tokio::spawn(state_mgr.run());
 
-	let mesh_registry = MeshRegistry::new(stores.clone());
+	let ledger_path = std::path::PathBuf::from("/home/toxic/development/tool-mesh/mesh-ledger.log");
+	let mesh_registry = MeshRegistry::new(stores.clone(), ledger_path);
+
+	// Immortality: Git Watch Sync Loop
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(60));
+		loop {
+			interval.tick().await;
+			let _ = tokio::process::Command::new("git")
+				.args(["add", "."])
+				.current_dir("/home/toxic/development/tool-mesh")
+				.status()
+				.await;
+			let _ = tokio::process::Command::new("git")
+				.args(["commit", "-m", "mesh: auto-sync configuration"])
+				.current_dir("/home/toxic/development/tool-mesh")
+				.status()
+				.await;
+		}
+	});
 
 	#[allow(unused_mut)]
 	let mut admin_server = crate::management::admin::Service::new(

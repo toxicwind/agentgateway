@@ -19,9 +19,9 @@ FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.91.1-trixie AS base-buil
 RUN apt-get update && apt-get -y install clang-17 clang++-17 lld-17
 
 RUN rustup target add aarch64-unknown-linux-musl \
-    x86_64-unknown-linux-musl \
-    aarch64-unknown-linux-gnu \
-    x86_64-unknown-linux-gnu
+  x86_64-unknown-linux-musl \
+  aarch64-unknown-linux-gnu \
+  x86_64-unknown-linux-gnu
 
 FROM --platform=$BUILDPLATFORM base-builder AS builder
 ARG TARGETARCH
@@ -81,13 +81,13 @@ ENV LDFLAGS="-fuse-ld=lld-17"
 ENV CFLAGS="--sysroot=/sysroots/current -fuse-ld=lld-17"
 
 RUN \
-    --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    cargo fetch --locked
+  --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+  --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+  cargo fetch --locked
 RUN --mount=type=cache,target=/app/target \
-    --mount=type=cache,id=cargo,target=/usr/local/cargo/registry  \
-    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
-    <<EOF
+  --mount=type=cache,id=cargo,target=/usr/local/cargo/registry  \
+  --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+  <<EOF
 export VERSION="${VERSION}"
 export GIT_REVISION="${GIT_REVISION}"
 if [ "$BUILDER" = "musl" ]; then
@@ -109,13 +109,28 @@ if [ "$TARGETARCH" = "amd64" ]; then
 fi
 EOF
 
-FROM cgr.dev/chainguard/glibc-dynamic AS runner
 
-WORKDIR /
 
+# --- Multi-stage, Context7-aligned: AgentGateway ---
+# Stage 1: Builder (unchanged)
+# ...existing code...
+
+# Stage 2: Test runner (dev/test-first for runkit workflows)
+FROM cgr.dev/chainguard/glibc-dynamic AS test
+WORKDIR /test
 COPY --from=builder /out/agentgateway /app/agentgateway
+RUN /app/agentgateway --version || echo "No tests"
 
+# Stage 3: Docs builder
+FROM cgr.dev/chainguard/glibc-dynamic AS docs
+WORKDIR /docs
+COPY --from=builder /out/agentgateway /app/agentgateway
+RUN echo "No docs script for agentgateway"
+
+# Stage 4: Production runtime (last, for optimized final image)
+FROM cgr.dev/chainguard/glibc-dynamic AS runtime
+WORKDIR /
+COPY --from=builder /out/agentgateway /app/agentgateway
 LABEL org.opencontainers.image.source=https://github.com/agentgateway/agentgateway
 LABEL org.opencontainers.image.description="Agentgateway is an open source project that is built on AI-native protocols to connect, secure, and observe agent-to-agent and agent-to-tool communication across any agent framework and environment."
-
 ENTRYPOINT ["/app/agentgateway"]

@@ -4,8 +4,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use tokio::time;
+use tokio::sync::broadcast;
 
 use crate::store::Stores;
+use crate::ledger::RecoveryLedger;
 use crate::types::proto::agent::Resource as ADPResource;
 use crate::types::proto::agent::resource::Kind as XdsKind;
 use crate::types::proto::agent::{
@@ -48,6 +50,13 @@ pub struct MeshHeartbeat {
     pub is_blessed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MeshEvent {
+    NodeUpdated(MeshHeartbeat),
+    NodeRemoved(String),
+}
+
 pub struct MeshNode {
     pub metadata: MeshHeartbeat,
     pub last_seen: Instant,
@@ -58,13 +67,19 @@ pub struct MeshNode {
 pub struct MeshRegistry {
     stores: Stores,
     nodes: Arc<RwLock<HashMap<String, MeshNode>>>,
+    events: broadcast::Sender<MeshEvent>,
+    ledger: Arc<RecoveryLedger>,
 }
 
 impl MeshRegistry {
-    pub fn new(stores: Stores) -> Self {
+    pub fn new(stores: Stores, ledger_path: std::path::PathBuf) -> Self {
+        let (events, _) = broadcast::channel(100);
+        let ledger = Arc::new(RecoveryLedger::new(ledger_path));
         let registry = Self {
             stores,
             nodes: Arc::new(RwLock::new(HashMap::new())),
+            events,
+            ledger,
         };
 
         // Start Self-Healing Loop (Zombie Cleanup)
@@ -122,7 +137,14 @@ impl MeshRegistry {
         });
 
         // Project into ADP
-        self.project_to_adp(heartbeat)?;
+        self.project_to_adp(heartbeat.clone())?;
+
+        self.ledger.log(&name, "register", serde_json::to_value(&heartbeat).unwrap_or_default());
+
+        let _ = self.events.send(MeshEvent::NodeUpdated(MeshHeartbeat {
+            is_blessed,
+            ..heartbeat
+        }));
 
         Ok(token)
     }
@@ -146,6 +168,8 @@ impl MeshRegistry {
                 warn!(service=%name, "mesh node heartbeat timed out, evicting zombie from ADP");
                 nodes.remove(&name);
                 let _ = self.evict_from_adp(&name);
+                self.ledger.log(&name, "evict", serde_json::json!({"reason": "timeout"}));
+                let _ = self.events.send(MeshEvent::NodeRemoved(name));
             }
         }
     }
@@ -231,5 +255,9 @@ impl MeshRegistry {
     pub fn validate_token(&self, service_name: &str, token: &str) -> bool {
         let nodes = self.nodes.read().unwrap();
         nodes.get(service_name).map(|n| n.token == token).unwrap_or(false)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<MeshEvent> {
+        self.events.subscribe()
     }
 }

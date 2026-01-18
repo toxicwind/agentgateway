@@ -150,6 +150,7 @@ impl Service {
 				"/logging" => Ok(handle_logging(req).await),
 				"/mesh/register" => Ok(handle_mesh_register(&state.mesh_registry, req).await),
 				"/mesh/nodes" => Ok(handle_mesh_nodes(&state.mesh_registry, req).await),
+				"/mesh/events" => Ok(handle_mesh_events(&state.mesh_registry, req).await),
 				"/mesh/logs" => Ok(handle_mesh_logs(&state.mesh_registry, req).await),
 				_ => {
 					if let Some(h) = &state.admin_fallback {
@@ -571,4 +572,30 @@ async fn handle_mesh_nodes(registry: &MeshRegistry, _req: Request<Incoming>) -> 
 		hyper::header::HeaderValue::from_static("application/json"),
 	);
 	response
+}
+
+async fn handle_mesh_events(registry: &MeshRegistry, _req: Request<Incoming>) -> Response {
+	use futures::StreamExt;
+	use tokio_stream::wrappers::BroadcastStream;
+
+	let rx = registry.subscribe();
+	let stream = BroadcastStream::new(rx).map(|event| {
+		match event {
+			Ok(e) => {
+				let json = serde_json::to_string(&e).unwrap_or_default();
+				Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", json))
+			},
+			Err(_) => Ok::<_, std::convert::Infallible>(": keep-alive\n\n".to_string()),
+		}
+	});
+
+	::http::Response::builder()
+		.status(hyper::StatusCode::OK)
+		.header(hyper::header::CONTENT_TYPE, "text/event-stream")
+		.header(hyper::header::CACHE_CONTROL, "no-cache")
+		.header(hyper::header::CONNECTION, "keep-alive")
+		.body(crate::http::Body::new(http_body_util::StreamBody::new(
+			stream.map(|s| Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(bytes::Bytes::from(s.unwrap()))))
+		)))
+		.expect("builder with known status code should not fail")
 }
